@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keyMonitor = KeyMonitor(inputSourceManager: inputSourceManager)
 
         setSystemIndicator(enabled: false)
-        keyMonitor.start()
+        startKeyMonitorWhenTrusted()
 
         let isLoginItem = SMAppService.mainApp.status == .enabled
         let event = NSAppleEventManager.shared().currentAppleEvent
@@ -37,6 +37,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         openSettings()
         return false
+    }
+
+    private func startKeyMonitorWhenTrusted() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        if AXIsProcessTrustedWithOptions(options) && keyMonitor.start() { return }
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self, AXIsProcessTrusted(), self.keyMonitor.start() else { return }
+            timer.invalidate()
+        }
     }
 
     private func setSystemIndicator(enabled: Bool) {

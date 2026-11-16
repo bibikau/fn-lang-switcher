@@ -22,5 +22,6 @@ Download the latest version from [GitHub Releases](https://github.com/tonku321/f
 
 ## How it works
 
-- Monitors the FN key via `NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged)`
-- Switches input sources using the Carbon `TISSelectInputSource` API
+- Intercepts keyboard events with an active `CGEventTap`, which needs Accessibility access
+- Switches input sources on FN press using the Carbon `TISSelectInputSource` API
+- FN never reaches the system: FN + letter types the letter, FN + arrows and FN + Delete act as plain arrows and Delete, FN + F1-F12 keep FN

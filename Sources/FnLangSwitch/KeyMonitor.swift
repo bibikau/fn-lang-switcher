@@ -1,72 +1,113 @@
+import Carbon.HIToolbox
 import Cocoa
 
+/// Fn only switches the input source: the system never sees it as a modifier,
+/// so Fn + letter types the letter. F1-F12 keep Fn so the top row still works.
 final class KeyMonitor {
     private let inputSourceManager: InputSourceManager
-    private var monitor: Any?
-    private var fnWasDown = false
-    private var otherKeyPressed = false
-    private var fnPressTime: UInt64 = 0
+    private var tap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var fnDown = false
+    private var remappedKeys: Set<Int64> = []
 
-    /// Maximum interval (ns) for a plain Fn tap — a quick tap switches, a held Fn does not.
-    private static let tapThresholdNs: UInt64 = 400_000_000 // 400 ms
+    private static let keysWithFn: Set<Int64> = Set([
+        kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6,
+        kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12,
+        kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
+    ].map(Int64.init))
 
-    private var switchOnRelease: Bool {
-        UserDefaults.standard.bool(forKey: "switchOnRelease")
-    }
+    // The keyboard driver turns Fn + arrow / Delete into these before any event tap sees them.
+    private static let navigationTargets: [Int64: Int64] = [
+        Int64(kVK_Home): Int64(kVK_LeftArrow),
+        Int64(kVK_End): Int64(kVK_RightArrow),
+        Int64(kVK_PageUp): Int64(kVK_UpArrow),
+        Int64(kVK_PageDown): Int64(kVK_DownArrow),
+        Int64(kVK_ForwardDelete): Int64(kVK_Delete),
+    ]
 
     init(inputSourceManager: InputSourceManager) {
         self.inputSourceManager = inputSourceManager
     }
 
-    func start() {
-        monitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.flagsChanged, .keyDown, .keyUp, .systemDefined]
-        ) { [weak self] event in
-            self?.handleEvent(event)
-        }
+    /// Fails until the app has Accessibility access.
+    func start() -> Bool {
+        if tap != nil { return true }
+        let types: [CGEventType] = [.flagsChanged, .keyDown, .keyUp]
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                return Unmanaged<KeyMonitor>.fromOpaque(userInfo).takeUnretainedValue().handle(type, event)
+            },
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else { return false }
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        self.tap = tap
+        runLoopSource = source
+        return true
     }
 
     func stop() {
-        if let monitor { NSEvent.removeMonitor(monitor) }
-        monitor = nil
+        guard let tap else { return }
+        CGEvent.tapEnable(tap: tap, enable: false)
+        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+        CFMachPortInvalidate(tap)
+        self.tap = nil
+        runLoopSource = nil
     }
 
-    private func handleEvent(_ event: NSEvent) {
-        if event.type == .flagsChanged {
-            handleFlags(event)
-        } else if fnWasDown && switchOnRelease {
-            otherKeyPressed = true
+    private func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(event)
+        case .flagsChanged:
+            let isFnPressed = event.flags.contains(.maskSecondaryFn)
+            guard isFnPressed != fnDown else {
+                if fnDown { event.flags.remove(.maskSecondaryFn) }
+                return Unmanaged.passUnretained(event)
+            }
+            fnDown = isFnPressed
+            if fnDown { inputSourceManager.toggleInputSource() }
+            return nil
+        case .keyDown, .keyUp:
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            if let target = Self.navigationTargets[code], fnDown || remappedKeys.contains(code) {
+                if type == .keyDown { remappedKeys.insert(code) } else { remappedKeys.remove(code) }
+                return remap(event, type, to: target)
+            }
+            if fnDown && Self.keysWithFn.contains(code) == false {
+                event.flags.remove(.maskSecondaryFn)
+            }
+            return Unmanaged.passUnretained(event)
+        default:
+            return Unmanaged.passUnretained(event)
         }
     }
 
-    private func handleFlags(_ event: NSEvent) {
-        let fnDown = event.modifierFlags.contains(.function)
-
-        if fnDown && !fnWasDown {
-            // Fn just pressed
-            if switchOnRelease {
-                otherKeyPressed = false
-                fnPressTime = mach_absolute_time()
-            } else {
-                inputSourceManager.toggleInputSource()
-            }
-        } else if !fnDown && fnWasDown {
-            // Fn just released
-            if switchOnRelease {
-                let elapsed = mach_absolute_time() - fnPressTime
-                var info = mach_timebase_info_data_t()
-                mach_timebase_info(&info)
-                let elapsedNs = elapsed * UInt64(info.numer) / UInt64(info.denom)
-                if !otherKeyPressed && elapsedNs < Self.tapThresholdNs {
-                    inputSourceManager.toggleInputSource()
-                }
-            }
-        } else if fnDown && fnWasDown && switchOnRelease {
-            // Other modifier changed while Fn is held (e.g. Fn+Shift)
-            otherKeyPressed = true
+    // A new event rather than an edited keycode: the original keeps the Home / End characters.
+    private func remap(_ event: CGEvent, _ type: CGEventType, to target: Int64) -> Unmanaged<CGEvent>? {
+        guard let remapped = CGEvent(
+            keyboardEventSource: CGEventSource(event: event),
+            virtualKey: CGKeyCode(target),
+            keyDown: type == .keyDown
+        ) else { return Unmanaged.passUnretained(event) }
+        var flags = event.flags
+        if target == Int64(kVK_Delete) {
+            flags.subtract([.maskSecondaryFn, .maskNumericPad])
+        } else {
+            flags.formUnion([.maskSecondaryFn, .maskNumericPad])
         }
-
-        fnWasDown = fnDown
+        remapped.flags = flags
+        remapped.timestamp = event.timestamp
+        remapped.setIntegerValueField(.keyboardEventAutorepeat, value: event.getIntegerValueField(.keyboardEventAutorepeat))
+        remapped.setIntegerValueField(.keyboardEventKeyboardType, value: event.getIntegerValueField(.keyboardEventKeyboardType))
+        return Unmanaged.passRetained(remapped)
     }
 
     deinit { stop() }
