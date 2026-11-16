@@ -24,8 +24,9 @@ final class InputSourceManager {
         }
     }
 
-    func toggleInputSource() {
-        guard inputSources.count > 1 else { return }
+    /// Returns the source it switched away from.
+    func toggleInputSource() -> TISInputSource? {
+        guard inputSources.count > 1 else { return nil }
 
         let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
         let currentID = inputSourceID(current)
@@ -36,6 +37,7 @@ final class InputSourceManager {
         }
 
         TISSelectInputSource(inputSources[nextIndex])
+        return current
     }
 
     private func inputSourceID(_ source: TISInputSource) -> String {

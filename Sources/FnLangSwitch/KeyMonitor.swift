@@ -8,11 +8,15 @@ final class KeyMonitor {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var fnDown = false
+    private var sourceBeforeFn: TISInputSource?
     private var remappedKeys: Set<Int64> = []
 
-    private static let keysWithFn: Set<Int64> = Set([
+    private static let functionKeys: Set<Int64> = Set([
         kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6,
         kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12,
+    ].map(Int64.init))
+
+    private static let keysWithFn: Set<Int64> = functionKeys.union([
         kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
     ].map(Int64.init))
 
@@ -73,10 +77,17 @@ final class KeyMonitor {
                 return Unmanaged.passUnretained(event)
             }
             fnDown = isFnPressed
-            if fnDown { inputSourceManager.toggleInputSource() }
+            sourceBeforeFn = fnDown ? inputSourceManager.toggleInputSource() : nil
             return nil
         case .keyDown, .keyUp:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
+            if fnDown && type == .keyDown {
+                // Fn held only for F1-F12 was never meant as a switch: the press switched too early, undo it.
+                if Self.functionKeys.contains(code), let source = sourceBeforeFn {
+                    TISSelectInputSource(source)
+                }
+                sourceBeforeFn = nil
+            }
             if let target = Self.navigationTargets[code], fnDown || remappedKeys.contains(code) {
                 if type == .keyDown { remappedKeys.insert(code) } else { remappedKeys.remove(code) }
                 return remap(event, type, to: target)
